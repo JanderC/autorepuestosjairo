@@ -2,8 +2,6 @@ const pool = require('../../config/db');
 const { convertirAUSD } = require('../../utils/conversionMoneda');
 
 const MONEDAS = ['USD', 'COP', 'BS'];
-
-// Match robusto de "efectivo": no depende de que el nombre esté escrito exactamente igual
 const CONDICION_EFECTIVO = `TRIM(LOWER(mp.nombre)) = 'efectivo'`;
 
 async function obtenerSesionAbierta(req, res) {
@@ -54,7 +52,6 @@ async function registrarMovimiento(req, res) {
   }
 
   try {
-    // La sesión se resuelve acá, no se confía en la que mande el frontend
     const sesionResultado = await pool.query(
       `SELECT id FROM sesiones_caja WHERE estado = 'abierta' ORDER BY fecha_apertura DESC LIMIT 1`
     );
@@ -85,7 +82,6 @@ async function registrarMovimiento(req, res) {
   }
 }
 
-// Calcula, para una sesión y moneda, cada componente del cuadre por separado
 async function calcularDesglose(sesion, moneda) {
   const id = sesion.id;
 
@@ -152,7 +148,6 @@ async function calcularDesglose(sesion, moneda) {
     egresos: total_egresos,
     abonos_efectivo,
     fiado_otorgado,
-    // Solo el efectivo físico entra al cuadre: lo que se pagó por transferencia/punto no está en el cajón
     esperado_efectivo: fondo_inicial + ventas_efectivo + total_ingresos - total_egresos + abonos_efectivo
   };
 }
@@ -293,7 +288,7 @@ async function movimientosDelDia(req, res) {
     );
 
     const abonos = await pool.query(
-      `SELECT mc.id, mc.moneda, mc.monto, mc.fecha, c.nombre AS cliente, mp.nombre AS metodo
+      `SELECT mc.id, mc.moneda, mc.monto, mc.fecha, mc.referencia, c.nombre AS cliente, mp.nombre AS metodo
        FROM movimientos_cuenta mc
        JOIN clientes c ON c.id = mc.cliente_id
        LEFT JOIN metodos_pago mp ON mp.id = mc.metodo_pago_id
@@ -319,8 +314,11 @@ async function movimientosDelDia(req, res) {
         tipo: m.tipo, fecha: m.fecha, detalle: `${m.concepto} · ${m.usuario}`,
         moneda: m.moneda, monto: Number(m.monto)
       })),
+      // Si la referencia trae texto (ej. "Devolución venta X"), se muestra en vez del genérico
+      // "Abono de..." — así se distingue de un abono real de plata en mano.
       ...abonos.rows.map((a) => ({
-        tipo: 'abono', fecha: a.fecha, detalle: `Abono de ${a.cliente}${a.metodo ? ` (${a.metodo})` : ''}`,
+        tipo: 'abono', fecha: a.fecha,
+        detalle: a.referencia ? `${a.referencia} — ${a.cliente}` : `Abono de ${a.cliente}${a.metodo ? ` (${a.metodo})` : ''}`,
         moneda: a.moneda, monto: Number(a.monto)
       })),
       ...fiados.rows.map((f) => ({
