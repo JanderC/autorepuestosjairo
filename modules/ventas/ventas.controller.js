@@ -16,8 +16,6 @@ async function obtenerTasaVigente(client) {
   return resultado.rows[0];
 }
 
-// La sesión de caja SIEMPRE se resuelve en el backend: el frontend puede tener el dato
-// desactualizado si la caja se abrió después de cargar la pantalla.
 async function resolverSesionCajaAbierta(client) {
   const resultado = await client.query(
     `SELECT id FROM sesiones_caja WHERE estado = 'abierta' ORDER BY fecha_apertura DESC LIMIT 1`
@@ -25,8 +23,18 @@ async function resolverSesionCajaAbierta(client) {
   return resultado.rows[0]?.id || null;
 }
 
+async function obtenerSaldoCliente(client, clienteId, moneda) {
+  const resultado = await client.query(
+    `SELECT COALESCE(SUM(CASE WHEN tipo='cargo' THEN monto ELSE 0 END),0) -
+            COALESCE(SUM(CASE WHEN tipo='abono' THEN monto ELSE 0 END),0) AS saldo
+     FROM movimientos_cuenta WHERE cliente_id = $1 AND moneda = $2`,
+    [clienteId, moneda]
+  );
+  return Number(resultado.rows[0].saldo);
+}
+
 async function crearVenta(req, res) {
-  const { productos, pagos, cliente_id, moneda_venta } = req.body;
+  const { productos, pagos, cliente_id, moneda_venta, aplicar_credito } = req.body;
   const usuario_id = req.usuario.id;
 
   if (!productos || productos.length === 0) {
@@ -35,7 +43,7 @@ async function crearVenta(req, res) {
   if (!pagos) {
     return res.status(400).json({ message: 'Debe incluir información de pago' });
   }
-  if (pagos.length === 0 && !cliente_id) {
+  if (pagos.length === 0 && !cliente_id && !(aplicar_credito > 0)) {
     return res.status(400).json({ message: 'Debe incluir al menos un método de pago, o asignar un cliente para fiar completo' });
   }
 
@@ -67,11 +75,8 @@ async function crearVenta(req, res) {
         throw new Error(`Stock insuficiente para "${producto.nombre}" (disponible: ${producto.stock})`);
       }
 
-      // Precio "de lista": el que calcula el sistema según el producto (base, fijo, o cruce COP<->BS)
       const precioListaOriginal = precioEfectivoEnMoneda(producto, monedaEfectiva, tasa);
 
-      // Precio final aplicado: si el cajero mandó un precio manual para esta línea (descuento o
-      // recargo), se respeta ese; si no vino nada, se usa el precio de lista tal cual.
       const tienePrecioManual = item.precio_unitario_manual != null && item.precio_unitario_manual !== '';
       const precioUnitarioOriginal = tienePrecioManual
         ? redondear(Number(item.precio_unitario_manual), 2)
@@ -100,13 +105,27 @@ async function crearVenta(req, res) {
       await client.query('UPDATE productos SET stock = stock - $1 WHERE id = $2', [item.cantidad, producto.id]);
     }
 
-    // Diferencia entre lo que "daba el sistema" y lo que realmente se cobró.
-    // Positivo = se dio descuento; negativo = se cobró de más.
     const ajusteUSD = redondear(totalListaUSD - totalUSD, 2);
     const huboAjuste = Math.abs(ajusteUSD) > 0.005;
     const ajusteUsuarioId = huboAjuste ? usuario_id : null;
 
     let restanteEnMonedaVenta = totalEnMonedaVenta;
+
+    // Saldo a favor: se descuenta ANTES que cualquier pago en efectivo.
+    let creditoAplicadoFinal = 0;
+    if (aplicar_credito && Number(aplicar_credito) > 0) {
+      if (!cliente_id) throw new Error('Para aplicar saldo a favor necesitás asociar un cliente a la venta');
+
+      const saldo = await obtenerSaldoCliente(client, cliente_id, monedaEfectiva);
+      const creditoDisponible = saldo < 0 ? Math.abs(saldo) : 0;
+      if (creditoDisponible <= 0) {
+        throw new Error(`El cliente no tiene saldo a favor en ${monedaEfectiva}`);
+      }
+
+      creditoAplicadoFinal = Math.min(Number(aplicar_credito), creditoDisponible, restanteEnMonedaVenta);
+      restanteEnMonedaVenta = redondear(restanteEnMonedaVenta - creditoAplicadoFinal, 2);
+    }
+
     let excedenteEnMonedaVenta = 0;
     const pagosCalculados = [];
 
@@ -136,7 +155,6 @@ async function crearVenta(req, res) {
         });
         restanteEnMonedaVenta = redondear(restanteEnMonedaVenta - montoEnMonedaVenta, 2);
       } else {
-        // Esta línea cubre lo que falta y además sobra vuelto
         const aplicadoEnMonedaVenta = restanteEnMonedaVenta;
         const aplicadoEnMonedaPago = pago.moneda === monedaEfectiva
           ? aplicadoEnMonedaVenta
@@ -202,7 +220,15 @@ async function crearVenta(req, res) {
       );
     }
 
-    // Cargo de fiado: EXACTO, en la moneda real de la venta, sin pasar por dólares
+    if (creditoAplicadoFinal > 0) {
+      const usdInformativo = convertirAUSD(creditoAplicadoFinal, monedaEfectiva, tasa);
+      await client.query(
+        `INSERT INTO movimientos_cuenta (cliente_id, tipo, moneda, monto, monto_usd, venta_id, sesion_caja_id, usuario_id, referencia)
+         VALUES ($1, 'cargo', $2, $3, $4, $5, $6, $7, $8)`,
+        [cliente_id, monedaEfectiva, creditoAplicadoFinal, usdInformativo, venta.id, sesionCajaResuelta, usuario_id, 'Aplicó saldo a favor']
+      );
+    }
+
     if (esFiado) {
       const montoCargo = restanteEnMonedaVenta;
       const usdInformativo = convertirAUSD(montoCargo, monedaEfectiva, tasa);
@@ -220,6 +246,7 @@ async function crearVenta(req, res) {
       venta,
       detalles,
       pagos: pagosCalculados,
+      credito_aplicado: creditoAplicadoFinal,
       vuelto_usd: convertirAUSD(excedenteEnMonedaVenta, monedaEfectiva, tasa),
       vuelto_moneda: vueltoMonedaFinal,
       vuelto_monto: vueltoMontoFinal,

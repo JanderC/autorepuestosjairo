@@ -14,6 +14,7 @@ const clientesRoutes = require('./modules/clientes/clientes.routes');
 const colaboracionesRoutes = require('./modules/colaboraciones/colaboraciones.routes');
 const facturasProveedorRoutes = require('./modules/facturas-proveedor/facturas-proveedor.routes');
 const devolucionesRoutes = require('./modules/devoluciones/devoluciones.routes');
+const consignacionesRoutes = require('./modules/consignaciones/consignaciones.routes');
 
 process.env.TZ = 'America/Caracas';
 const iniciarCronCaja = require('./utils/cronCaja');
@@ -49,6 +50,7 @@ app.use('/api/clientes', clientesRoutes);
 app.use('/api/colaboraciones', colaboracionesRoutes);
 app.use('/api/facturas-proveedor', facturasProveedorRoutes);
 app.use('/api/devoluciones', devolucionesRoutes);
+app.use('/api/consignaciones', consignacionesRoutes);
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {

@@ -48,7 +48,8 @@ async function crearCliente(req, res) {
   }
 }
 
-// Saldo pendiente por moneda + historial completo de movimientos
+// Saldo por moneda: positivo = debe (fiado), negativo = tiene saldo a favor.
+// Ya NO se filtran los negativos — antes un HAVING > 0.01 los escondía por completo.
 async function obtenerEstadoCuenta(req, res) {
   const { id } = req.params;
   try {
@@ -64,8 +65,10 @@ async function obtenerEstadoCuenta(req, res) {
        FROM movimientos_cuenta
        WHERE cliente_id = $1
        GROUP BY moneda
-       HAVING COALESCE(SUM(CASE WHEN tipo = 'cargo' THEN monto ELSE 0 END), 0) -
-              COALESCE(SUM(CASE WHEN tipo = 'abono' THEN monto ELSE 0 END), 0) > 0.01`,
+       HAVING ABS(
+         COALESCE(SUM(CASE WHEN tipo = 'cargo' THEN monto ELSE 0 END), 0) -
+         COALESCE(SUM(CASE WHEN tipo = 'abono' THEN monto ELSE 0 END), 0)
+       ) > 0.01`,
       [id]
     );
 
@@ -89,7 +92,6 @@ async function obtenerEstadoCuenta(req, res) {
   }
 }
 
-// Abono: reduce el saldo pendiente del cliente en esa moneda
 async function registrarAbono(req, res) {
   const { cliente_id, moneda, monto, metodo_pago_id, referencia } = req.body;
   const usuario_id = req.usuario.id;
@@ -112,7 +114,6 @@ async function registrarAbono(req, res) {
     const tasa = tasaResultado.rows[0];
     const montoUsd = convertirAUSD(monto, moneda, tasa);
 
-    // La sesión de caja se resuelve acá, no se confía en la que mande el frontend
     const sesionResultado = await client.query(
       `SELECT id FROM sesiones_caja WHERE estado = 'abierta' ORDER BY fecha_apertura DESC LIMIT 1`
     );
@@ -135,7 +136,6 @@ async function registrarAbono(req, res) {
   }
 }
 
-// Todos los clientes con saldo pendiente > 0, por moneda
 async function listarFiadosPendientes(req, res) {
   try {
     const resultado = await pool.query(`
@@ -155,7 +155,6 @@ async function listarFiadosPendientes(req, res) {
   }
 }
 
-// Total pendiente por moneda + cantidad de clientes con deuda
 async function resumenFiados(req, res) {
   try {
     const resultado = await pool.query(`

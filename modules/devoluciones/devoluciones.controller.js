@@ -57,7 +57,7 @@ async function obtenerVentaDevolvible(req, res) {
 }
 
 async function crearDevolucion(req, res) {
-  const { venta_id, items, tipo_reembolso, moneda_reembolso, metodo_pago_id, motivo } = req.body;
+  const { venta_id, items, tipo_reembolso, moneda_reembolso, metodo_pago_id, motivo, cliente_id } = req.body;
   const usuario_id = req.usuario.id;
 
   if (!venta_id || !items || items.length === 0) {
@@ -138,11 +138,28 @@ async function crearDevolucion(req, res) {
       );
     }
 
+    // A quién se le acredita el saldo a favor: si la venta ya tenía cliente, es ese;
+    // si fue una venta sin cliente (mostrador), el cajero elige uno en el momento.
+    let clienteDestinoCredito = null;
+    if (tipoFinal === 'fiado' && !venta.cliente_id) {
+      throw new Error('Esta venta no tiene cliente asociado para reducir el fiado');
+    }
+    if (tipoFinal === 'credito') {
+      clienteDestinoCredito = venta.cliente_id || cliente_id || null;
+      if (!clienteDestinoCredito) {
+        throw new Error('Elegí a qué cliente guardarle el saldo a favor');
+      }
+    }
+
     const devolucionResultado = await client.query(
-      `INSERT INTO devoluciones (venta_id, tipo_reembolso, monto_reembolsado, moneda_reembolso, motivo, sesion_caja_id, usuario_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO devoluciones (venta_id, tipo_reembolso, monto_reembolsado, moneda_reembolso, motivo, sesion_caja_id, usuario_id, cliente_credito_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
-      [venta_id, tipoFinal, montoReembolso, tipoFinal !== 'ninguno' ? monedaFinal : null, motivo || null, sesionCajaId, usuario_id]
+      [
+        venta_id, tipoFinal, montoReembolso, tipoFinal !== 'ninguno' ? monedaFinal : null,
+        motivo || null, sesionCajaId, usuario_id,
+        tipoFinal === 'credito' && !venta.cliente_id ? clienteDestinoCredito : null
+      ]
     );
     const devolucion = devolucionResultado.rows[0];
 
@@ -154,8 +171,8 @@ async function crearDevolucion(req, res) {
       );
     }
 
-    // Efectivo devuelto: se registra como egreso de caja — reutiliza toda la lógica que ya
-    // suma/resta movimientos en Punto de Venta y en el cuadre de cierre, sin duplicar nada.
+    // Efectivo devuelto: egreso de caja — reutiliza toda la lógica que ya suma/resta
+    // movimientos en Punto de Venta y en el cuadre de cierre.
     if (tipoFinal === 'efectivo') {
       if (!metodo_pago_id) throw new Error('Indicá con qué método se le devolvió el dinero');
       if (!sesionCajaId) throw new Error('No hay una caja abierta para registrar la devolución en efectivo');
@@ -168,15 +185,24 @@ async function crearDevolucion(req, res) {
       );
     }
 
-    // Reduce fiado: mismo mecanismo que un abono, sin mover efectivo real
+    // Reduce fiado existente: mismo mecanismo que un abono, sin mover efectivo real.
     if (tipoFinal === 'fiado') {
-      if (!venta.cliente_id) throw new Error('Esta venta no tiene cliente asociado para reducir el fiado');
-
       const montoUsd = convertirAUSD(montoReembolso, monedaFinal, tasa);
       await client.query(
         `INSERT INTO movimientos_cuenta (cliente_id, tipo, moneda, monto, monto_usd, venta_id, sesion_caja_id, usuario_id, referencia)
          VALUES ($1, 'abono', $2, $3, $4, $5, $6, $7, $8)`,
         [venta.cliente_id, monedaFinal, montoReembolso, montoUsd, venta_id, sesionCajaId, usuario_id, `Devolución venta ${venta.numero_venta}`]
+      );
+    }
+
+    // Saldo a favor: un 'abono' sin deuda que lo cubra dejando el saldo en negativo — eso ES
+    // el crédito. No toca movimientos_caja, así que la caja del día queda intacta.
+    if (tipoFinal === 'credito') {
+      const montoUsd = convertirAUSD(montoReembolso, monedaFinal, tasa);
+      await client.query(
+        `INSERT INTO movimientos_cuenta (cliente_id, tipo, moneda, monto, monto_usd, venta_id, sesion_caja_id, usuario_id, referencia)
+         VALUES ($1, 'abono', $2, $3, $4, $5, $6, $7, $8)`,
+        [clienteDestinoCredito, monedaFinal, montoReembolso, montoUsd, venta_id, sesionCajaId, usuario_id, `Saldo a favor por devolución ${venta.numero_venta}`]
       );
     }
 
