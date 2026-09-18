@@ -15,6 +15,34 @@ async function obtenerCantidadesDevueltas(ejecutor, ventaId) {
   return mapa;
 }
 
+// Busca ventas por el nombre del producto vendido — pensado para cuando no se tiene a mano
+// el folio, que es difícil de recordar ("van a devolver una estopera de hace días").
+async function buscarVentasPorProducto(req, res) {
+  const { q } = req.query;
+  if (!q || q.trim().length < 2) {
+    return res.status(400).json({ message: 'Indicá al menos 2 caracteres para buscar' });
+  }
+  try {
+    const resultado = await pool.query(
+      `SELECT DISTINCT ON (v.id) v.id, v.numero_venta, v.fecha, v.estado,
+              u.nombre AS vendedor, c.nombre AS cliente_nombre, p.nombre AS producto_nombre
+       FROM detalle_venta dv
+       JOIN ventas v ON v.id = dv.venta_id
+       JOIN productos p ON p.id = dv.producto_id
+       JOIN usuarios u ON u.id = v.usuario_id
+       LEFT JOIN clientes c ON c.id = v.cliente_id
+       WHERE p.nombre ILIKE $1 AND v.estado <> 'anulada'
+       ORDER BY v.id, v.fecha DESC
+       LIMIT 30`,
+      [`%${q.trim()}%`]
+    );
+    resultado.rows.sort((a, b) => new Date(b.fecha) - new Date(a.fecha));
+    res.json(resultado.rows);
+  } catch (error) {
+    res.status(500).json({ message: 'Error al buscar por producto', error: error.message });
+  }
+}
+
 async function obtenerVentaDevolvible(req, res) {
   const { ventaId } = req.params;
   try {
@@ -57,7 +85,10 @@ async function obtenerVentaDevolvible(req, res) {
 }
 
 async function crearDevolucion(req, res) {
-  const { venta_id, items, tipo_reembolso, moneda_reembolso, metodo_pago_id, motivo, cliente_id } = req.body;
+  const {
+    venta_id, items, tipo_reembolso, moneda_reembolso, metodo_pago_id, motivo, cliente_id,
+    monto_manual, direccion_efectivo
+  } = req.body;
   const usuario_id = req.usuario.id;
 
   if (!venta_id || !items || items.length === 0) {
@@ -132,14 +163,14 @@ async function crearDevolucion(req, res) {
       );
       if (tasaResultado.rows.length === 0) throw new Error('No hay tasa de cambio registrada');
       tasa = tasaResultado.rows[0];
-      montoReembolso = redondear(
-        convertirEntreMonedas(montoTotalOriginal, monedaOriginalVenta, monedaFinal, tasa),
-        2
-      );
+
+      // El monto puede ajustarse a mano (útil en cambios donde el valor no coincide exacto
+      // con lo que dieron los productos seleccionados) — si no, se calcula automático.
+      montoReembolso = monto_manual != null && monto_manual !== ''
+        ? redondear(Number(monto_manual), 2)
+        : redondear(convertirEntreMonedas(montoTotalOriginal, monedaOriginalVenta, monedaFinal, tasa), 2);
     }
 
-    // A quién se le acredita el saldo a favor: si la venta ya tenía cliente, es ese;
-    // si fue una venta sin cliente (mostrador), el cajero elige uno en el momento.
     let clienteDestinoCredito = null;
     if (tipoFinal === 'fiado' && !venta.cliente_id) {
       throw new Error('Esta venta no tiene cliente asociado para reducir el fiado');
@@ -171,21 +202,26 @@ async function crearDevolucion(req, res) {
       );
     }
 
-    // Efectivo devuelto: egreso de caja — reutiliza toda la lógica que ya suma/resta
-    // movimientos en Punto de Venta y en el cuadre de cierre.
+    // Efectivo: puede ir en cualquiera de las dos direcciones.
+    // 'egreso' = le devolvemos plata (sale de caja) — el caso normal de una devolución.
+    // 'ingreso' = el cliente paga diferencia (entra a caja) — cuando cambia por algo más caro.
     if (tipoFinal === 'efectivo') {
-      if (!metodo_pago_id) throw new Error('Indicá con qué método se le devolvió el dinero');
-      if (!sesionCajaId) throw new Error('No hay una caja abierta para registrar la devolución en efectivo');
+      if (!metodo_pago_id) throw new Error('Indicá con qué método se movió el dinero');
+      if (!sesionCajaId) throw new Error('No hay una caja abierta para registrar este movimiento');
 
+      const direccion = direccion_efectivo === 'ingreso' ? 'ingreso' : 'egreso';
+      const concepto = direccion === 'ingreso'
+        ? `Cobro por cambio · venta ${venta.numero_venta}`
+        : `Devolución venta ${venta.numero_venta}`;
       const montoUsd = convertirAUSD(montoReembolso, monedaFinal, tasa);
+
       await client.query(
         `INSERT INTO movimientos_caja (sesion_caja_id, tipo, concepto, moneda, monto, monto_usd, usuario_id)
-         VALUES ($1, 'egreso', $2, $3, $4, $5, $6)`,
-        [sesionCajaId, `Devolución venta ${venta.numero_venta}`, monedaFinal, montoReembolso, montoUsd, usuario_id]
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [sesionCajaId, direccion, concepto, monedaFinal, montoReembolso, montoUsd, usuario_id]
       );
     }
 
-    // Reduce fiado existente: mismo mecanismo que un abono, sin mover efectivo real.
     if (tipoFinal === 'fiado') {
       const montoUsd = convertirAUSD(montoReembolso, monedaFinal, tasa);
       await client.query(
@@ -195,8 +231,6 @@ async function crearDevolucion(req, res) {
       );
     }
 
-    // Saldo a favor: un 'abono' sin deuda que lo cubra dejando el saldo en negativo — eso ES
-    // el crédito. No toca movimientos_caja, así que la caja del día queda intacta.
     if (tipoFinal === 'credito') {
       const montoUsd = convertirAUSD(montoReembolso, monedaFinal, tasa);
       await client.query(
@@ -244,4 +278,4 @@ async function listarDevoluciones(req, res) {
   }
 }
 
-module.exports = { obtenerVentaDevolvible, crearDevolucion, listarDevoluciones };
+module.exports = { obtenerVentaDevolvible, crearDevolucion, listarDevoluciones, buscarVentasPorProducto };
