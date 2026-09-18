@@ -1,12 +1,12 @@
 const pool = require('../../config/db');
-const { convertirAUSD, convertirEntreMonedas, redondear } = require('../../utils/conversionMoneda');
+const { convertirAUSD, convertirEntreMonedas, precioEfectivoEnMoneda, redondear } = require('../../utils/conversionMoneda');
 
 async function obtenerCantidadesDevueltas(ejecutor, ventaId) {
   const resultado = await ejecutor.query(
     `SELECT dd.producto_id, COALESCE(SUM(dd.cantidad), 0) AS cantidad_devuelta
      FROM detalle_devolucion dd
      JOIN devoluciones d ON d.id = dd.devolucion_id
-     WHERE d.venta_id = $1
+     WHERE d.venta_id = $1 AND dd.tipo_item = 'devuelto'
      GROUP BY dd.producto_id`,
     [ventaId]
   );
@@ -15,8 +15,6 @@ async function obtenerCantidadesDevueltas(ejecutor, ventaId) {
   return mapa;
 }
 
-// Busca ventas por el nombre del producto vendido — pensado para cuando no se tiene a mano
-// el folio, que es difícil de recordar ("van a devolver una estopera de hace días").
 async function buscarVentasPorProducto(req, res) {
   const { q } = req.query;
   if (!q || q.trim().length < 2) {
@@ -86,8 +84,8 @@ async function obtenerVentaDevolvible(req, res) {
 
 async function crearDevolucion(req, res) {
   const {
-    venta_id, items, tipo_reembolso, moneda_reembolso, metodo_pago_id, motivo, cliente_id,
-    monto_manual, direccion_efectivo
+    venta_id, items, items_cambio, tipo_reembolso, moneda_reembolso,
+    metodo_pago_id, motivo, cliente_id, monto_manual
   } = req.body;
   const usuario_id = req.usuario.id;
 
@@ -115,6 +113,7 @@ async function crearDevolucion(req, res) {
     );
     const sesionCajaId = sesionResultado.rows[0]?.id || null;
 
+    // --- Productos que vuelven al inventario ---
     let montoTotalOriginal = 0;
     let monedaOriginalVenta = null;
     const detallesDevolucion = [];
@@ -152,34 +151,87 @@ async function crearDevolucion(req, res) {
 
     if (detallesDevolucion.length === 0) throw new Error('No hay productos para devolver');
 
-    const tipoFinal = tipo_reembolso || 'ninguno';
+    const hayCambio = items_cambio && items_cambio.length > 0;
     const monedaFinal = moneda_reembolso || monedaOriginalVenta;
-    let montoReembolso = 0;
-    let tasa = null;
 
-    if (tipoFinal !== 'ninguno') {
+    let tasa = null;
+    if ((tipo_reembolso && tipo_reembolso !== 'ninguno') || hayCambio || monedaFinal !== monedaOriginalVenta) {
       const tasaResultado = await client.query(
         'SELECT * FROM tasas_cambio ORDER BY fecha DESC, created_at DESC LIMIT 1'
       );
       if (tasaResultado.rows.length === 0) throw new Error('No hay tasa de cambio registrada');
       tasa = tasaResultado.rows[0];
-
-      // El monto puede ajustarse a mano (útil en cambios donde el valor no coincide exacto
-      // con lo que dieron los productos seleccionados) — si no, se calcula automático.
-      montoReembolso = monto_manual != null && monto_manual !== ''
-        ? redondear(Number(monto_manual), 2)
-        : redondear(convertirEntreMonedas(montoTotalOriginal, monedaOriginalVenta, monedaFinal, tasa), 2);
     }
 
-    let clienteDestinoCredito = null;
-    if (tipoFinal === 'fiado' && !venta.cliente_id) {
+    // --- Productos que se entregan a cambio: salen del inventario, valorizados a precio actual ---
+    let montoCambioLiquidacion = 0;
+    const detallesCambio = [];
+    if (hayCambio) {
+      for (const itemCambio of items_cambio) {
+        const cantidad = Number(itemCambio.cantidad) || 0;
+        if (cantidad <= 0) continue;
+
+        const productoResultado = await client.query(
+          'SELECT * FROM productos WHERE id = $1 AND activo = true FOR UPDATE',
+          [itemCambio.producto_id]
+        );
+        if (productoResultado.rows.length === 0) throw new Error(`Producto de cambio ${itemCambio.producto_id} no encontrado`);
+        const productoCambio = productoResultado.rows[0];
+
+        if (productoCambio.stock < cantidad) {
+          throw new Error(`Stock insuficiente para "${productoCambio.nombre}" (disponible: ${productoCambio.stock})`);
+        }
+
+        const precioUnitarioCambio = precioEfectivoEnMoneda(productoCambio, monedaFinal, tasa);
+        const subtotalCambio = redondear(precioUnitarioCambio * cantidad, 2);
+        montoCambioLiquidacion = redondear(montoCambioLiquidacion + subtotalCambio, 2);
+
+        detallesCambio.push({
+          producto_id: productoCambio.id,
+          cantidad,
+          precio_unitario_original: precioUnitarioCambio,
+          subtotal_original: subtotalCambio,
+          moneda_original: monedaFinal,
+        });
+
+        await client.query(
+          'UPDATE productos SET stock = stock - $1, updated_at = NOW() WHERE id = $2',
+          [cantidad, productoCambio.id]
+        );
+      }
+    }
+
+    // --- Diferencia a liquidar: positiva = se le debe al cliente; negativa = el cliente paga ---
+    const valorDevueltoLiquidacion = redondear(
+      monedaFinal === monedaOriginalVenta ? montoTotalOriginal : convertirEntreMonedas(montoTotalOriginal, monedaOriginalVenta, monedaFinal, tasa),
+      2
+    );
+    let diferencia = redondear(valorDevueltoLiquidacion - montoCambioLiquidacion, 2);
+
+    if (monto_manual != null && monto_manual !== '') {
+      const magnitud = Math.abs(Number(monto_manual));
+      diferencia = diferencia >= 0 ? magnitud : -magnitud;
+    }
+
+    const tipoFinal = tipo_reembolso || 'ninguno';
+    const huboDiferencia = Math.abs(diferencia) > 0.01;
+
+    let clienteDestino = null;
+    if (tipoFinal === 'fiado' && diferencia >= 0 && !venta.cliente_id) {
       throw new Error('Esta venta no tiene cliente asociado para reducir el fiado');
     }
+    if (tipoFinal === 'fiado' && diferencia < 0) {
+      clienteDestino = venta.cliente_id || cliente_id || null;
+      if (!clienteDestino) throw new Error('Elegí a qué cliente se le fía la diferencia');
+    }
     if (tipoFinal === 'credito') {
-      clienteDestinoCredito = venta.cliente_id || cliente_id || null;
-      if (!clienteDestinoCredito) {
-        throw new Error('Elegí a qué cliente guardarle el saldo a favor');
-      }
+      if (diferencia < 0) throw new Error('No se puede dar saldo a favor cuando el cliente debe pagar diferencia');
+      clienteDestino = venta.cliente_id || cliente_id || null;
+      if (!clienteDestino) throw new Error('Elegí a qué cliente guardarle el saldo a favor');
+    }
+    if (tipoFinal === 'efectivo') {
+      if (!metodo_pago_id) throw new Error('Indicá con qué método se movió el dinero');
+      if (huboDiferencia && !sesionCajaId) throw new Error('No hay una caja abierta para registrar este movimiento');
     }
 
     const devolucionResultado = await client.query(
@@ -187,56 +239,64 @@ async function crearDevolucion(req, res) {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
       [
-        venta_id, tipoFinal, montoReembolso, tipoFinal !== 'ninguno' ? monedaFinal : null,
+        venta_id, tipoFinal, huboDiferencia ? Math.abs(diferencia) : 0, huboDiferencia ? monedaFinal : null,
         motivo || null, sesionCajaId, usuario_id,
-        tipoFinal === 'credito' && !venta.cliente_id ? clienteDestinoCredito : null
+        clienteDestino && !venta.cliente_id ? clienteDestino : null
       ]
     );
     const devolucion = devolucionResultado.rows[0];
 
     for (const d of detallesDevolucion) {
       await client.query(
-        `INSERT INTO detalle_devolucion (devolucion_id, producto_id, cantidad, precio_unitario_original, subtotal_original, moneda_original)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+        `INSERT INTO detalle_devolucion (devolucion_id, producto_id, cantidad, precio_unitario_original, subtotal_original, moneda_original, tipo_item)
+         VALUES ($1, $2, $3, $4, $5, $6, 'devuelto')`,
+        [devolucion.id, d.producto_id, d.cantidad, d.precio_unitario_original, d.subtotal_original, d.moneda_original]
+      );
+    }
+    for (const d of detallesCambio) {
+      await client.query(
+        `INSERT INTO detalle_devolucion (devolucion_id, producto_id, cantidad, precio_unitario_original, subtotal_original, moneda_original, tipo_item)
+         VALUES ($1, $2, $3, $4, $5, $6, 'entregado')`,
         [devolucion.id, d.producto_id, d.cantidad, d.precio_unitario_original, d.subtotal_original, d.moneda_original]
       );
     }
 
-    // Efectivo: puede ir en cualquiera de las dos direcciones.
-    // 'egreso' = le devolvemos plata (sale de caja) — el caso normal de una devolución.
-    // 'ingreso' = el cliente paga diferencia (entra a caja) — cuando cambia por algo más caro.
-    if (tipoFinal === 'efectivo') {
-      if (!metodo_pago_id) throw new Error('Indicá con qué método se movió el dinero');
-      if (!sesionCajaId) throw new Error('No hay una caja abierta para registrar este movimiento');
-
-      const direccion = direccion_efectivo === 'ingreso' ? 'ingreso' : 'egreso';
-      const concepto = direccion === 'ingreso'
-        ? `Cobro por cambio · venta ${venta.numero_venta}`
-        : `Devolución venta ${venta.numero_venta}`;
-      const montoUsd = convertirAUSD(montoReembolso, monedaFinal, tasa);
-
+    if (huboDiferencia && tipoFinal === 'efectivo') {
+      const direccion = diferencia > 0 ? 'egreso' : 'ingreso';
+      const concepto = diferencia > 0
+        ? `Devolución venta ${venta.numero_venta}`
+        : `Cobro por cambio · venta ${venta.numero_venta}`;
+      const montoUsd = convertirAUSD(Math.abs(diferencia), monedaFinal, tasa);
       await client.query(
         `INSERT INTO movimientos_caja (sesion_caja_id, tipo, concepto, moneda, monto, monto_usd, usuario_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [sesionCajaId, direccion, concepto, monedaFinal, montoReembolso, montoUsd, usuario_id]
+        [sesionCajaId, direccion, concepto, monedaFinal, Math.abs(diferencia), montoUsd, usuario_id]
       );
     }
 
-    if (tipoFinal === 'fiado') {
-      const montoUsd = convertirAUSD(montoReembolso, monedaFinal, tasa);
-      await client.query(
-        `INSERT INTO movimientos_cuenta (cliente_id, tipo, moneda, monto, monto_usd, venta_id, sesion_caja_id, usuario_id, referencia)
-         VALUES ($1, 'abono', $2, $3, $4, $5, $6, $7, $8)`,
-        [venta.cliente_id, monedaFinal, montoReembolso, montoUsd, venta_id, sesionCajaId, usuario_id, `Devolución venta ${venta.numero_venta}`]
-      );
+    if (huboDiferencia && tipoFinal === 'fiado') {
+      const montoUsd = convertirAUSD(Math.abs(diferencia), monedaFinal, tasa);
+      if (diferencia > 0) {
+        await client.query(
+          `INSERT INTO movimientos_cuenta (cliente_id, tipo, moneda, monto, monto_usd, venta_id, sesion_caja_id, usuario_id, referencia)
+           VALUES ($1, 'abono', $2, $3, $4, $5, $6, $7, $8)`,
+          [venta.cliente_id, monedaFinal, diferencia, montoUsd, venta_id, sesionCajaId, usuario_id, `Devolución venta ${venta.numero_venta}`]
+        );
+      } else {
+        await client.query(
+          `INSERT INTO movimientos_cuenta (cliente_id, tipo, moneda, monto, monto_usd, venta_id, sesion_caja_id, usuario_id, referencia)
+           VALUES ($1, 'cargo', $2, $3, $4, $5, $6, $7, $8)`,
+          [clienteDestino, monedaFinal, Math.abs(diferencia), montoUsd, venta_id, sesionCajaId, usuario_id, `Diferencia por cambio · venta ${venta.numero_venta}`]
+        );
+      }
     }
 
-    if (tipoFinal === 'credito') {
-      const montoUsd = convertirAUSD(montoReembolso, monedaFinal, tasa);
+    if (huboDiferencia && tipoFinal === 'credito') {
+      const montoUsd = convertirAUSD(diferencia, monedaFinal, tasa);
       await client.query(
         `INSERT INTO movimientos_cuenta (cliente_id, tipo, moneda, monto, monto_usd, venta_id, sesion_caja_id, usuario_id, referencia)
          VALUES ($1, 'abono', $2, $3, $4, $5, $6, $7, $8)`,
-        [clienteDestinoCredito, monedaFinal, montoReembolso, montoUsd, venta_id, sesionCajaId, usuario_id, `Saldo a favor por devolución ${venta.numero_venta}`]
+        [clienteDestino, monedaFinal, diferencia, montoUsd, venta_id, sesionCajaId, usuario_id, `Saldo a favor por devolución ${venta.numero_venta}`]
       );
     }
 
@@ -244,8 +304,9 @@ async function crearDevolucion(req, res) {
     res.status(201).json({
       devolucion,
       detalles: detallesDevolucion,
-      monto_reembolsado: montoReembolso,
-      moneda_reembolso: tipoFinal !== 'ninguno' ? monedaFinal : null,
+      detalles_cambio: detallesCambio,
+      diferencia,
+      moneda_liquidacion: huboDiferencia ? monedaFinal : null,
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -262,7 +323,8 @@ async function listarDevoluciones(req, res) {
         (
           SELECT json_agg(json_build_object(
             'producto_nombre', p.nombre, 'cantidad', dd.cantidad,
-            'subtotal_original', dd.subtotal_original, 'moneda_original', dd.moneda_original
+            'subtotal_original', dd.subtotal_original, 'moneda_original', dd.moneda_original,
+            'tipo_item', dd.tipo_item
           ))
           FROM detalle_devolucion dd JOIN productos p ON p.id = dd.producto_id
           WHERE dd.devolucion_id = d.id
